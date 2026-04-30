@@ -1,0 +1,27 @@
+# 认知实验室 - 用户配置
+database:
+  path: "~/.cognitive-lab/data.db"
+
+interference:
+  enabled: false
+  intensity: 0.3
+  mode: "on_request"
+  domains:
+    - professional
+
+commitment:
+  lock_strength: "light"
+  exit_cooldown_hours: 0
+  trusted_contact: ""
+
+lab:
+  enabled: true
+  simulation_parallel_count: 3
+
+language:
+  style: "auto"
+
+data:
+  retention_days: 365
+  export_format: "json"
+  auto_export_on_exit: false
