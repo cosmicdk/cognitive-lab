@@ -1,32 +1,20 @@
-"""Skill interface — v0.3.0
+"""Skill: AI Response Cognitive Quality Detector — A Skill That Does One Thing Well
 
-Cognitive Lab's correct form: a function callable directly from the conversation flow.
+One file. Zero dependencies. Three functions. Drop into any AI conversation system.
 
-Not a standalone CLI tool. Not a background daemon. Not an observer outside the conversation loop.
-It's a function called when AI generates a response, that directly improves the output.
+Detects 5 issues in AI responses: single-framework bias, over-certainty, 
+missing counterbalance, overgeneralization, and avoidance.
 
 Usage:
-    from cognitive_lab.skill import enhance_response
+    from cognitive_lab.skill import enhance_response, quick_check
 
-    result = enhance_response(
-        user_query="Should I leave my job to start a company?",
-        ai_draft="If you leave, you may face income loss and failure risk...",
-        user_history=["I've always been torn about career choices", "Last job switch was hard"],
-        user_schemas=["SafetyFirst", "ZeroSum"]
-    )
-
-    # result has:
-    #   - has_issues: bool
-    #   - improved_response: str | None
-    #   - warnings: list
-    #   - analysis: dict
-
-Also:
-    from cognitive_lab.skill import quick_check, analyze_conversation_pair
+    result = enhance_response(user_query, ai_draft, user_schemas=["SafetyFirst", "Abundance"])
+    if result.has_issues:
+        return result.improved_response
 """
 
 import re
-from typing import Optional, List, Dict
+from typing import List, Optional
 from dataclasses import dataclass, field
 
 
@@ -38,294 +26,224 @@ class EnhancementResult:
     analysis: dict = field(default_factory=dict)
 
 
-CERTAINTY_WORDS_ZH = [
-    "一定", "绝对", "肯定", "必然", "毫无疑问", "毋庸置疑",
-    "显然", "从来都是", "永远都是", "不可能", "绝不会", "必定",
-]
-CERTAINTY_WORDS_EN = [
-    "definitely", "absolutely", "certainly", "undoubtedly",
-    "always", "never", "must be", "no doubt", "inevitably",
-]
-OVERGENERALIZE_ZH = ["总是", "每次", "从不", "一直", "永远", "所有人", "没人", "全都是"]
-OVERGENERALIZE_EN = ["always", "never", "everyone", "nobody", "everything", "nothing"]
+# ── Detection lexicons ──
 
-COUNTERBALANCE_WORDS = [
+CERTAINTY = [
+    "一定", "绝对", "肯定", "必然", "毫无疑问", "毋庸置疑",
+    "显然", "不可能", "绝不会", "必定", "注定", "唯一.*正确",
+    "definitely", "absolutely", "certainly", "undoubtedly", "must be", "no doubt",
+]
+
+OVERGENERALIZE = [
+    "总是", "每次", "从不", "一直", "永远", "所有人", "没人", "全都是",
+    "always", "never", "everyone", "nobody", "everything", "nothing",
+]
+
+COUNTERBALANCE = [
     "不过", "但是", "然而", "另一方面", "但也", "例外",
     "however", "on the other hand", "alternatively",
-    "不一定", "取决于", "看情况", "it depends",
-    "换个角度", "另一种可能是",
+    "不一定", "取决于", "看情况", "it depends", "换个角度",
 ]
 
-AVOIDANCE_WORDS_ZH = [
-    "需要更多信息", "很难说", "取决于很多因素", "因人而异",
-    "这个问题的答案很复杂", "没有标准答案",
+AVOIDANCE = [
+    "需要更多信息", "很难说", "因人而异", "没有标准答案",
+    "这个问题的答案很复杂",
 ]
 
-FRAMEWORK_PATTERNS = [
-    {
-        "name": "ZeroSum",
-        "patterns": ["win.*lose", "zero.sum", "零和", "此消彼长", "有限资源"],
-        "opposite": "Abundance",
-        "opposite_prompt": "Could resources grow through innovation and collaboration, rather than being fixed?"
-    },
-    {
-        "name": "SafetyFirst",
-        "patterns": ["风险", "稳定", "安全", "保守", "失败率", "退路", "保险", "确定", "risk", "safe"],
-        "opposite": "GrowthOriented",
-        "opposite_prompt": "Consider: what is the cost of not taking a risk? What are the hidden costs of stability?"
-    },
-    {
-        "name": "Anchoring",
-        "patterns": ["百分之[0-9]+", "[0-9]+%", "平均", "大多数.*不", "绝大部分"],
-        "opposite": "BaseRateReview",
-        "opposite_prompt": "Does this statistic apply to this specific situation? Group statistics don't always apply to individuals."
-    },
-    {
-        "name": "ConfirmationBias",
-        "patterns": ["正是", "果然", "我就说", "证明了我", "说明我是对的"],
-        "opposite": "Falsification",
-        "opposite_prompt": "Try assuming your view is wrong first, and then look for evidence against it."
-    },
-    {
-        "name": "BinaryThinking",
-        "patterns": ["要么.*要么", "二选一", "只能", "非黑即白"],
-        "opposite": "SpectrumThinking",
-        "opposite_prompt": "Is this really a binary choice? Could there be a third path, or shades of gray between the two options?"
-    },
-    {
-        "name": "Catastrophizing",
-        "patterns": ["完蛋", "没救了", "万劫不复", "毁掉", "不可挽回"],
-        "opposite": "ProbabilityCalibration",
-        "opposite_prompt": "What is the actual probability of the worst case? Even if it happens, is there a way to deal with it?"
-    },
+# Framework patterns: each needs >=2 pattern hits to trigger (reduces false positives)
+FRAMEWORKS = [
+    ("ZeroSum", ["win.*lose", "零和", "此消彼长", "有限资源", "一方赢.*一方输"], "Abundance",
+     "Could resources grow through innovation and collaboration rather than being fixed?"),
+    ("SafetyFirst", ["risk.*too high", "failure rate.{0,5}[0-9]+%", "safest.*is", "退路", "稳定.*最重要"], "GrowthOriented",
+     "What's the cost of NOT taking a risk? What are the hidden costs of stability?"),
+    ("Anchoring", ["[0-9]+%.{0,10}fail", "average.*not", "most.*don't", "百分之[0-9]+", "绝大部分.*不"], "BaseRateReview",
+     "Do these statistics apply to this specific situation? Group stats don't always apply to individuals."),
+    ("ConfirmationBias", ["just as I said", "this proves", "I told you", "正是.*证明", "说明我是对的"], "Falsification",
+     "Try assuming your view is wrong first, then look for evidence against it."),
+    ("BinaryThinking", ["either.*or", "二选一", "只能.*不能", "非黑即白"], "SpectrumThinking",
+     "Is this really a binary choice? Could there be a third path?"),
+    ("Catastrophizing", ["完蛋", "没救了", "万劫不复", "不可挽回", "毁掉"], "ProbabilityCalibration",
+     "What's the actual probability of the worst case? Even if it happens, what's the response?"),
 ]
 
+
+# ── Core functions ──
 
 def enhance_response(
-    user_query: str,
-    ai_draft: str,
-    user_history: List[str] = None,
+    user_query: str = "",
+    ai_draft: str = "",
     user_schemas: List[str] = None,
     mode: str = "auto",
 ) -> EnhancementResult:
-    """Analyze AI response draft, detect cognitive issues, generate improved version.
+    """Analyze AI response draft, detect cognitive issues, optionally return improved version.
 
     Args:
-        user_query: user's latest question
+        user_query: user's question
         ai_draft: AI's draft response
-        user_history: recent conversation history (optional)
-        user_schemas: user's known cognitive schema names (optional)
+        user_schemas: user's known cognitive schema names (e.g. ["SafetyFirst", "Abundance"])
         mode: "analyze_only" | "auto" | "suggest"
 
     Returns:
-        EnhancementResult with has_issues, warnings, analysis, and optionally improved_response
+        EnhancementResult(has_issues, improved_response, warnings, analysis)
     """
+    draft = ai_draft or ""
+    draft_lower = draft.lower()
     result = EnhancementResult()
-    analysis = {}
     warnings = []
+    analysis = {}
 
-    draft_lower = ai_draft.lower() if ai_draft else ""
-
-    # 1. Single framework bias
-    if user_schemas:
-        matched_schemas = []
-        for schema_name in user_schemas:
-            keywords = _extract_keywords(schema_name)
-            if any(kw.lower() in draft_lower for kw in keywords):
-                matched_schemas.append(schema_name)
-
-        active_count = len(matched_schemas)
-        total_count = len(user_schemas)
-        analysis["schema_coverage"] = {
-            "matched": matched_schemas,
-            "total_available": total_count,
-            "coverage_ratio": active_count / total_count if total_count > 0 else 0,
-        }
-
-        if total_count >= 2 and active_count <= total_count * 0.3 and active_count == 1:
-            unused = [s for s in user_schemas if s not in matched_schemas]
-            warnings.append(
-                f"Response uses only 1 framework ({matched_schemas[0]}), "
-                f"but user has {total_count} known frameworks. "
-                f"Also consider: {' / '.join(unused[:2])}"
-            )
-            analysis["single_framework_warning"] = True
-            analysis["missing_perspectives"] = unused
-
-    # 2. Over-certainty
-    cert_count = sum(
-        1 for w in CERTAINTY_WORDS_ZH + CERTAINTY_WORDS_EN
-        if w.lower() in draft_lower
-    )
-    analysis["certainty_words"] = cert_count
-    if cert_count >= 3:
+    # 1. Over-certainty (threshold: >=2 words)
+    cert_hits = [w for w in CERTAINTY if w.lower() in draft_lower or re.search(w, draft)]
+    analysis["certainty_count"] = len(cert_hits)
+    analysis["certainty_words"] = cert_hits[:5]
+    if len(cert_hits) >= 2:
         warnings.append(
-            f"Response uses {cert_count} certainty words (e.g. 'definitely/absolutely/always'). "
+            f"Uses {len(cert_hits)} certainty words ({', '.join(cert_hits[:3])}...). "
             f"Suggest adding qualifiers like 'based on current information' or 'in most cases'."
         )
 
-    # 3. Missing counterbalance
-    has_counterbalance = any(w.lower() in draft_lower for w in COUNTERBALANCE_WORDS)
+    # 2. Missing counterbalance
+    has_counterbalance = any(w.lower() in draft_lower for w in COUNTERBALANCE)
     analysis["has_counterbalance"] = has_counterbalance
-    if not has_counterbalance and len(ai_draft) > 200:
+    if not has_counterbalance and len(draft) > 150:
         warnings.append(
-            "Response lacks any counter-argument or balancing statement "
-            "(e.g. 'however/on the other hand/it depends'). Only one side presented."
+            "Response lacks counterbalancing statements (e.g. 'however/on the other hand/it depends'). "
+            "May present only one side."
         )
 
-    # 4. Overgeneralization
-    overgen_count = sum(
-        1 for w in OVERGENERALIZE_ZH + OVERGENERALIZE_EN
-        if w.lower() in draft_lower
-    )
-    analysis["overgeneralization_words"] = overgen_count
-    if overgen_count >= 2:
+    # 3. Overgeneralization
+    overgen_hits = [w for w in OVERGENERALIZE if w.lower() in draft_lower]
+    analysis["overgeneralization_count"] = len(overgen_hits)
+    if len(overgen_hits) >= 2:
         warnings.append(
-            f"Response uses {overgen_count} overgeneralizing words "
-            f"(e.g. 'always/never/everyone'). Suggest more precise descriptions."
+            f"Uses {len(overgen_hits)} overgeneralizing words ({', '.join(overgen_hits[:3])}...). "
+            f"Suggest more precise descriptions."
         )
 
-    # 5. Avoidance
-    has_avoidance = any(w in ai_draft for w in AVOIDANCE_WORDS_ZH)
-    analysis["possible_avoidance"] = has_avoidance
-    if has_avoidance:
-        avoidance_count = sum(1 for w in AVOIDANCE_WORDS_ZH if w in ai_draft)
-        if avoidance_count >= 2 and len(ai_draft) < 300:
+    # 4. Avoidance
+    avoidance_hits = [w for w in AVOIDANCE if w in draft]
+    analysis["avoidance_count"] = len(avoidance_hits)
+    if len(avoidance_hits) >= 2:
+        warnings.append(
+            "Response uses multiple avoidance phrases ('it depends/varies by person') "
+            "without offering a concrete framework. Appears to dodge giving specific advice."
+        )
+
+    # 5. Single-framework bias
+    if user_schemas and len(user_schemas) >= 2:
+        matched = [s for s in user_schemas if _schema_matches(s, draft_lower)]
+        analysis["schema_coverage"] = {
+            "matched": matched, "total": len(user_schemas),
+            "ratio": len(matched) / len(user_schemas),
+        }
+        if len(matched) == 1 and len(user_schemas) >= 3:
+            unused = [s for s in user_schemas if s not in matched]
             warnings.append(
-                "Response appears to avoid giving specific advice "
-                "(uses 'it depends/varies by person' multiple times without offering a concrete framework)."
+                f"Response only uses '{matched[0]}' perspective, "
+                f"but user has {len(user_schemas)} known frameworks. "
+                f"Also consider: {'/'.join(unused[:2])}"
             )
+            analysis["missing_perspectives"] = unused
 
-    # 6. Cognitive framework detection
-    detected_frameworks = []
-    for fp in FRAMEWORK_PATTERNS:
-        matched_patterns = [p for p in fp["patterns"] if re.search(p, ai_draft)]
-        if matched_patterns:
-            detected_frameworks.append({
-                "name": fp["name"],
-                "opposite": fp["opposite"],
-                "opposite_prompt": fp["opposite_prompt"],
-            })
+    # 6. Framework pattern detection (only alarm when no counterbalance)
+    detected = []
+    for name, patterns, opposite, prompt in FRAMEWORKS:
+        hits = [p for p in patterns if re.search(p, draft)]
+        if len(hits) >= 2:  # need >=2 pattern hits to reduce false positives
+            detected.append({"name": name, "opposite": opposite, "prompt": prompt})
 
-    analysis["detected_cognitive_frameworks"] = [
-        {"name": df["name"], "opposite": df["opposite"]}
-        for df in detected_frameworks
-    ]
+    analysis["detected_frameworks"] = [{"name": d["name"]} for d in detected]
 
-    if detected_frameworks:
-        names = [df["name"] for df in detected_frameworks]
-        opposites = [df["opposite"] for df in detected_frameworks]
-        prompt = "; ".join(df["opposite_prompt"] for df in detected_frameworks)
+    if detected and not has_counterbalance:
+        names = [d["name"] for d in detected]
+        opposites = [d["opposite"] for d in detected]
+        prompts = [d["prompt"] for d in detected]
         warnings.append(
-            f"Detected cognitive patterns in response: {', '.join(names)}. "
-            f"Consider adding {'/'.join(opposites)} perspective."
+            f"Detected '{', '.join(names)}' thinking pattern. "
+            f"Suggest adding {'/'.join(opposites)} perspective: {'; '.join(prompts)}"
         )
-        analysis["framework_opposites_needed"] = opposites
-        analysis["opposite_prompt"] = prompt
+        analysis["opposite_prompts"] = prompts
 
-    # 7. History repetition
-    if user_history and len(user_history) >= 2:
-        history_check = _check_repetition(ai_draft, user_history[-3:])
-        analysis["history_repetition"] = history_check
-        if history_check.get("is_repeating"):
-            warnings.append(
-                "Response structure is highly similar to recent responses. "
-                "Long-term use of the same framework can make different questions look alike."
-            )
-
-    result.analysis = analysis
     result.warnings = warnings
+    result.analysis = analysis
     result.has_issues = len(warnings) > 0
 
     if not result.has_issues:
         return result
 
-    if mode == "analyze_only":
-        return result
-
     if mode == "auto":
-        result.improved_response = _build_improved_response(ai_draft, analysis, warnings)
+        result.improved_response = _improve(draft, analysis)
     elif mode == "suggest":
-        result.improved_response = ai_draft + "\n\n---\n\n" + _build_suggestions(warnings, analysis)
+        result.improved_response = draft + "\n\n---\n**Cognitive Notes**\n" + \
+            "\n".join(f"- {w}" for w in warnings)
 
     return result
 
 
-def _extract_keywords(label: str) -> List[str]:
-    words = re.findall(r'[\u4e00-\u9fff]{2,4}|[a-zA-Z]{3,}', label)
-    return [w for w in words if w.lower() not in ("1", "2", "3")]
+def quick_check(ai_draft: str, user_schemas: List[str] = None) -> dict:
+    """One-liner: check AI response quality.
+    
+    >>> quick_check("This is definitely wrong, you absolutely must act now.")
+    {'has_issues': True, 'warnings': [...], 'score': 0.6}
+    """
+    result = enhance_response(ai_draft=ai_draft, user_schemas=user_schemas, mode="analyze_only")
+    score = _compute_score(result)
+    return {"has_issues": result.has_issues, "warnings": result.warnings, "score": score}
 
 
-def _check_repetition(draft: str, history: List[str]) -> dict:
-    draft_lower = draft.lower()
-    draft_phrases = set(re.findall(r'[\u4e00-\u9fff]{4,}', draft_lower))
-    similar_count = 0
-    for h in history:
-        h_phrases = set(re.findall(r'[\u4e00-\u9fff]{4,}', h.lower()))
-        if len(draft_phrases & h_phrases) >= 5:
-            similar_count += 1
-    return {"is_repeating": similar_count >= 2, "similar_to_count": similar_count}
-
-
-def _build_improved_response(original: str, analysis: dict, warnings: List[str]) -> str:
-    lines = original.strip().split("\n")
-    improved = []
-
-    if analysis.get("single_framework_warning") and analysis.get("missing_perspectives"):
-        missing = analysis["missing_perspectives"]
-        prompt = analysis.get("opposite_prompt", "")
-        improved.append(f"*(This analysis tries to consider {'/'.join(missing[:2])} perspectives as well. {prompt})*\n")
-
-    added_counterbalance = False
-    for i, line in enumerate(lines):
-        improved.append(line)
-        if not added_counterbalance and i > 1 and len(line) > 80:
-            if any(w in line for w in CERTAINTY_WORDS_ZH):
-                opposite = analysis.get("opposite_prompt", "")
-                if opposite:
-                    improved.append(f"\n*[Additional perspective] {opposite}*\n")
-                else:
-                    improved.append("\n*However, also consider: are the judgments above based on unexamined assumptions? Different frameworks may yield different conclusions.*\n")
-                added_counterbalance = True
-
-    if not added_counterbalance and not analysis.get("has_counterbalance"):
-        improved.append("\n---\n*Note: This analysis comes from one specific perspective. Different frameworks applied to the same problem may yield different conclusions. Try switching lenses.*")
-
-    return "\n".join(improved)
-
-
-def _build_suggestions(warnings: List[str], analysis: dict) -> str:
-    parts = ["**[Cognitive Notes]**"]
-    for w in warnings[:3]:
-        parts.append(f"- {w}")
-    if analysis.get("missing_perspectives"):
-        parts.append(f"- Suggested additional perspective: {' / '.join(analysis['missing_perspectives'][:2])}")
-    return "\n".join(parts)
-
-
-def quick_check(ai_draft: str) -> dict:
-    """Minimal call: just check AI response quality"""
-    result = enhance_response(user_query="", ai_draft=ai_draft, mode="analyze_only")
-    return {"has_issues": result.has_issues, "warnings": result.warnings}
-
-
-def analyze_conversation_pair(
-    user_says: str,
-    ai_says: str,
-    known_schemas: List[str] = None,
-) -> dict:
-    """Analyze one round of conversation quality"""
-    result = enhance_response(
-        user_query=user_says,
-        ai_draft=ai_says,
-        user_schemas=known_schemas,
-    )
-    cert_count = result.analysis.get("certainty_words", 0)
+def analyze_pair(user_says: str, ai_says: str, schemas: List[str] = None) -> dict:
+    """Analyze one round of conversation quality.
+    
+    Returns: {certainty_level, balance_score, frameworks_detected, suggestions}
+    """
+    result = enhance_response(user_query=user_says, ai_draft=ai_says, user_schemas=schemas)
+    cert = result.analysis.get("certainty_count", 0)
     return {
-        "framework_bias": result.analysis.get("schema_coverage", {}),
-        "certainty_level": "high" if cert_count >= 3 else ("medium" if cert_count >= 1 else "low"),
+        "certainty_level": "high" if cert >= 3 else ("medium" if cert >= 1 else "low"),
         "balance_score": 0.7 if result.analysis.get("has_counterbalance") else 0.3,
-        "avoidance_detected": result.analysis.get("possible_avoidance", False),
-        "detected_frameworks": result.analysis.get("detected_cognitive_frameworks", []),
-        "suggestions": [w for w in result.warnings],
+        "frameworks_detected": result.analysis.get("detected_frameworks", []),
+        "suggestions": result.warnings,
     }
+
+
+# ── Internal helpers ──
+
+def _schema_matches(name: str, text: str) -> bool:
+    keywords = re.findall(r'[\u4e00-\u9fff]{2,4}|[a-zA-Z]{3,}', name)
+    return any(kw.lower() in text for kw in keywords if kw.lower() not in ("1", "2", "3"))
+
+
+def _compute_score(result: EnhancementResult) -> float:
+    a = result.analysis
+    score = 1.0
+    if a.get("certainty_count", 0) >= 2: score -= 0.2
+    if not a.get("has_counterbalance"): score -= 0.2
+    if a.get("overgeneralization_count", 0) >= 2: score -= 0.15
+    if a.get("avoidance_count", 0) >= 2: score -= 0.15
+    if a.get("detected_frameworks"): score -= 0.1 * len(a["detected_frameworks"])
+    return max(0.0, round(score, 2))
+
+
+def _improve(draft: str, analysis: dict) -> str:
+    lines = draft.strip().split("\n")
+    out = []
+    missing = analysis.get("missing_perspectives", [])
+    prompts = analysis.get("opposite_prompts", [])
+    if missing:
+        out.append(f"*(This analysis also considers {'/'.join(missing[:2])} perspectives. {'; '.join(prompts[:2])})*\n")
+    inserted = False
+    for i, line in enumerate(lines):
+        out.append(line)
+        if not inserted and i > 1 and len(line) > 60:
+            if any(w in line for w in ["一定", "绝对", "肯定", "必然", "不可能"]):
+                if not analysis.get("has_counterbalance"):
+                    prompt_text = prompts[0] if prompts else \
+                        "Are the judgments above based on unexamined assumptions? Different frameworks may yield different conclusions."
+                    out.append(f"\n*[Additional perspective] {prompt_text}*\n")
+                    inserted = True
+    if not inserted and not analysis.get("has_counterbalance"):
+        out.append("\n---\n*Note: This analysis comes from one specific perspective. Different frameworks may yield different conclusions.*")
+    return "\n".join(out)
+
+
+analyze_conversation_pair = analyze_pair  # backward-compat alias
