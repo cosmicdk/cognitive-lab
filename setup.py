@@ -5,15 +5,15 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="cognitive-lab",
-    version="0.1.0",
+    version="0.2.0",
     author="Cognitive Lab Contributors",
-    description="思维实验室 — 一个追踪认知基模、支持多模型对比的认知发育环境",
+    description="Cognitive Lab v0.2.0 — automatic cognitive monitoring, multi-model comparison, and real-time intervention for your thinking patterns",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/cosmicdk/cognitive-lab",
     packages=find_packages(exclude=["tests*"]),
     classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 4 - Beta",
         "Intended Audience :: Developers",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
